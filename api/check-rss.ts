@@ -1,4 +1,4 @@
-// api/check-rss.ts - Çoklu Proje Desteği
+// api/check-rss.ts - Çoklu Proje Desteği (İyileştirilmiş)
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 interface WeblateChange {
@@ -13,8 +13,67 @@ interface WeblateChange {
 }
 
 interface Project {
-  slug: string;      // Weblate'teki proje slug'ı (URL'deki isim)
-  displayName: string; // Telegram mesajında görünecek isim
+  slug: string;
+  displayName: string;
+}
+
+// ⏱️ Timeout wrapper
+const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeout = 8000) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
+};
+
+// 📨 Telegram mesajı gönder (retry mekanizmalı)
+async function sendTelegramMessage(
+  botToken: string,
+  chatId: string,
+  message: string,
+  retries = 2
+): Promise<boolean> {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const response = await fetchWithTimeout(
+        `https://api.telegram.org/bot${botToken}/sendMessage`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            text: message,
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
+          }),
+        },
+        5000 // 5 saniye timeout
+      );
+      
+      if (response.ok) return true;
+      
+      const errorData = await response.json();
+      console.error(`Telegram error (attempt ${i + 1}):`, errorData);
+      
+      if (i < retries) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+      }
+    } catch (error) {
+      console.error(`Telegram request failed (attempt ${i + 1}):`, error);
+      if (i === retries) return false;
+      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+    }
+  }
+  return false;
 }
 
 export default async function handler(
@@ -24,12 +83,8 @@ export default async function handler(
   const BOT_TOKEN = process.env.BOT_TOKEN;
   const CHAT_ID = process.env.CHAT_ID;
   
-  // 🎯 Takip edilecek projeler - Buraya ekle/çıkar
   const projects: Project[] = [
     { slug: 'metrolist', displayName: 'Metrolist' },
-    // Yeni projeler eklemek için:
-    // { slug: 'proje-slug', displayName: 'Görünecek İsim' },
-    // { slug: 'another-project', displayName: 'Başka Proje' },
   ];
   
   if (!BOT_TOKEN || !CHAT_ID) {
@@ -41,21 +96,36 @@ export default async function handler(
     });
   }
 
+  // ⏰ Başlangıç zamanı - toplam süreyi kontrol et
+  const startTime = Date.now();
+  const MAX_EXECUTION_TIME = 9000; // 9 saniye (Vercel limit 10sn)
+
   try {
     let totalSent = 0;
     let totalRecent = 0;
     const results: any[] = [];
     
-    // Her proje için kontrol et
     for (const project of projects) {
+      // Zaman kontrolü
+      if (Date.now() - startTime > MAX_EXECUTION_TIME) {
+        console.warn('Execution time limit approaching, stopping early');
+        results.push({
+          project: project.displayName,
+          success: false,
+          error: 'Timeout - zaman aşımı'
+        });
+        break;
+      }
+      
       console.log(`Checking project: ${project.displayName} (${project.slug})`);
       
       const API_URL = `https://hosted.weblate.org/api/changes/?project=${project.slug}`;
       
       try {
-        const response = await fetch(API_URL, {
+        // ⏱️ Timeout ile fetch
+        const response = await fetchWithTimeout(API_URL, {
           headers: { 'Accept': 'application/json' }
-        });
+        }, 5000);
         
         if (!response.ok) {
           console.error(`API fetch failed for ${project.slug}: ${response.status}`);
@@ -86,7 +156,7 @@ export default async function handler(
           const changeTime = new Date(change.timestamp);
           const hoursDiff = (now.getTime() - changeTime.getTime()) / (1000 * 60 * 60);
           return hoursDiff <= 2;
-        }).slice(0, 5);
+        }).slice(0, 5); // Maksimum 5 değişiklik
         
         totalRecent += recentChanges.length;
         console.log(`${project.displayName}: ${recentChanges.length} recent changes`);
@@ -96,13 +166,20 @@ export default async function handler(
           ? recentChanges 
           : data.results.slice(0, 1);
         
-        // Telegram'a bildirim gönder
+        // 🚀 Telegram'a bildirim gönder (paralel)
         let sentCount = 0;
-        for (const change of changesToNotify) {
+        const sendPromises = changesToNotify.map(async (change, index) => {
+          // Zaman kontrolü
+          if (Date.now() - startTime > MAX_EXECUTION_TIME) {
+            return false;
+          }
+          
+          // Rate limiting için gecikme
+          await new Promise(resolve => setTimeout(resolve, index * 300));
+          
           const isRecent = recentChanges.length > 0;
           const emoji = isRecent ? '🔔' : '📋';
           
-          // Action'a göre emoji
           let actionEmoji = '⚡';
           const action = change.action_name.toLowerCase();
           if (action.includes('translation')) actionEmoji = '📝';
@@ -120,33 +197,13 @@ export default async function handler(
             (change.target ? `📄 <code>${change.target.substring(0, 100)}${change.target.length > 100 ? '...' : ''}</code>\n\n` : '') +
             (change.url ? `🔗 <a href="${change.url}">Detayları Gör</a>` : '');
 
-          const telegramResponse = await fetch(
-            `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: CHAT_ID,
-                text: message,
-                parse_mode: 'HTML',
-                disable_web_page_preview: true,
-              }),
-            }
-          );
-          
-          if (telegramResponse.ok) {
-            sentCount++;
-            totalSent++;
-          } else {
-            const errorData = await telegramResponse.json();
-            console.error('Telegram error:', errorData);
-          }
-          
-          // Rate limiting
-          if (changesToNotify.length > 1) {
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
-        }
+          return await sendTelegramMessage(BOT_TOKEN!, CHAT_ID!, message);
+        });
+        
+        // Tüm mesajları paralel gönder
+        const sendResults = await Promise.allSettled(sendPromises);
+        sentCount = sendResults.filter(r => r.status === 'fulfilled' && r.value).length;
+        totalSent += sentCount;
         
         results.push({
           project: project.displayName,
@@ -165,25 +222,31 @@ export default async function handler(
         });
       }
       
-      // Projeler arası bekleme
-      if (projects.length > 1) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      // Projeler arası bekleme (zaman varsa)
+      if (projects.length > 1 && Date.now() - startTime < MAX_EXECUTION_TIME - 1000) {
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
+    
+    const executionTime = Date.now() - startTime;
+    console.log(`Execution completed in ${executionTime}ms`);
     
     return res.status(200).json({ 
       success: true,
       total_notifications: totalSent,
       total_recent_changes: totalRecent,
       projects: results,
+      execution_time_ms: executionTime,
       message: `${totalSent} bildirim gönderildi (${projects.length} proje kontrol edildi)`
     });
 
   } catch (error) {
+    const executionTime = Date.now() - startTime;
     console.error('Global error:', error);
     return res.status(500).json({ 
       error: 'Check failed',
-      details: error instanceof Error ? error.message : 'Unknown error'
+      details: error instanceof Error ? error.message : 'Unknown error',
+      execution_time_ms: executionTime
     });
   }
-        }
+}
