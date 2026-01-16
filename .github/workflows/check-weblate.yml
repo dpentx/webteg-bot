@@ -1,0 +1,19 @@
+name: Check Weblate RSS
+
+on:
+  schedule:
+    # Her 30 dakikada bir çalışır (UTC saat dilimi)
+    - cron: '*/30 * * * *'
+  workflow_dispatch: # Manuel tetikleme için
+
+jobs:
+  check-rss:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check Weblate RSS and Notify
+        run: |
+          curl -X GET "https://webteg-bot.vercel.app/api/check-rss"
+        
+      - name: Log completion
+        run: echo "RSS check completed at $(date)"
