@@ -1,4 +1,4 @@
-// api/check-rss.ts - Timeout ve Bağlantı İyileştirmesi
+// api/check-rss.ts - Bileşen ve Dil Filtreli
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 interface WeblateChange {
@@ -10,11 +10,14 @@ interface WeblateChange {
   user: string;
   component: string;
   url: string;
+  language?: string;
 }
 
 interface Project {
   slug: string;
   displayName: string;
+  languageFilter?: string[];
+  componentFilter?: string[]; // Sadece bu bileşenleri takip et (opsiyonel)
 }
 
 // 📨 Telegram mesajı gönder
@@ -61,9 +64,19 @@ export default async function handler(
   
   // 🎯 Takip edilecek projeler
   const projects: Project[] = [
-    { slug: 'metrolist', displayName: 'Metrolist' },
-    // Yeni projeler eklemek için:
-    // { slug: 'f-droid', displayName: 'F-Droid' },
+    { 
+      slug: 'metrolist', 
+      displayName: 'Metrolist',
+      languageFilter: ['en'], // Sadece İngilizce
+      // componentFilter kullanmak istersen:
+      // componentFilter: ['morse-app', 'website', 'hosted'] // Sadece bunlar
+    },
+    // Yeni projeler:
+    // { 
+    //   slug: 'f-droid', 
+    //   displayName: 'F-Droid',
+    //   languageFilter: ['en']
+    // },
   ];
   
   if (!BOT_TOKEN || !CHAT_ID) {
@@ -80,18 +93,26 @@ export default async function handler(
   try {
     let totalSent = 0;
     let totalRecent = 0;
+    let totalFilteredLang = 0;
+    let totalFilteredComp = 0;
     const results: any[] = [];
     
     for (const project of projects) {
       console.log(`Checking project: ${project.displayName} (${project.slug})`);
       
-      // API URL'si - limit ekleyerek daha hızlı yanıt alıyoruz
-      const API_URL = `https://hosted.weblate.org/api/changes/?project=${project.slug}&page_size=10`;
+      // API URL'si
+      let API_URL = `https://hosted.weblate.org/api/changes/?project=${project.slug}&page_size=20`;
+      
+      // Dil filtresi varsa ekle
+      if (project.languageFilter && project.languageFilter.length > 0) {
+        const langParam = project.languageFilter.join(',');
+        API_URL += `&language=${langParam}`;
+        console.log(`Filtering languages: ${langParam}`);
+      }
       
       try {
         console.log(`Fetching: ${API_URL}`);
         
-        // Fetch without custom timeout wrapper - let Vercel handle it
         const response = await fetch(API_URL, {
           headers: { 
             'Accept': 'application/json',
@@ -124,13 +145,64 @@ export default async function handler(
           continue;
         }
         
-        // Son 3 saat içindeki değişiklikleri filtrele (daha geniş)
+        // 🔍 BİLEŞEN FİLTRESİ - Sadece projeye ait bileşenleri al
+        let filteredChanges = data.results.filter((change: WeblateChange) => {
+          // Component URL'den proje slug'ını çıkar
+          const componentUrl = change.component || '';
+          const projectMatch = componentUrl.match(/\/projects\/([^/]+)\//);
+          const changeProjectSlug = projectMatch ? projectMatch[1] : null;
+          
+          // Değişiklik başka bir projeyse filtrele
+          if (changeProjectSlug && changeProjectSlug !== project.slug) {
+            console.log(`Filtering out: ${componentUrl} (belongs to ${changeProjectSlug})`);
+            totalFilteredComp++;
+            return false;
+          }
+          
+          // Eğer componentFilter varsa, sadece belirtilen bileşenleri al
+          if (project.componentFilter && project.componentFilter.length > 0) {
+            const componentName = componentUrl.split('/').pop() || '';
+            const isAllowed = project.componentFilter.some(allowed => 
+              componentName.includes(allowed)
+            );
+            if (!isAllowed) {
+              console.log(`Filtering out component: ${componentName}`);
+              totalFilteredComp++;
+              return false;
+            }
+          }
+          
+          return true;
+        });
+        
+        console.log(`After component filter: ${filteredChanges.length} changes`);
+        
+        // Dil filtresi (double-check)
+        if (project.languageFilter && project.languageFilter.length > 0) {
+          const beforeLangFilter = filteredChanges.length;
+          filteredChanges = filteredChanges.filter((change: WeblateChange) => {
+            const langMatch = change.translation?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\//) || 
+                             change.url?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\/$/);
+            const changeLang = langMatch ? langMatch[1] : null;
+            
+            if (!changeLang) return true;
+            
+            return project.languageFilter!.includes(changeLang);
+          });
+          const filtered = beforeLangFilter - filteredChanges.length;
+          totalFilteredLang += filtered;
+          if (filtered > 0) {
+            console.log(`Filtered ${filtered} non-matching language changes`);
+          }
+        }
+        
+        // Son 3 saat içindeki değişiklikleri filtrele
         const now = new Date();
-        const recentChanges = data.results.filter((change: WeblateChange) => {
+        const recentChanges = filteredChanges.filter((change: WeblateChange) => {
           const changeTime = new Date(change.timestamp);
           const hoursDiff = (now.getTime() - changeTime.getTime()) / (1000 * 60 * 60);
-          return hoursDiff <= 3; // 3 saat
-        }).slice(0, 3); // Max 3 değişiklik
+          return hoursDiff <= 3;
+        }).slice(0, 5);
         
         totalRecent += recentChanges.length;
         console.log(`${project.displayName}: ${recentChanges.length} recent changes (last 3 hours)`);
@@ -138,7 +210,7 @@ export default async function handler(
         // Test için: Değişiklik yoksa en son 1 değişikliği göster
         const changesToNotify = recentChanges.length > 0 
           ? recentChanges 
-          : data.results.slice(0, 1);
+          : filteredChanges.slice(0, 1);
         
         console.log(`Will notify ${changesToNotify.length} changes`);
         
@@ -148,6 +220,15 @@ export default async function handler(
           const isRecent = recentChanges.length > 0;
           const emoji = isRecent ? '🔔' : '📋';
           
+          // Component ismini temizle (sadece son kısım)
+          const componentName = change.component?.split('/').pop() || 'Bilinmiyor';
+          
+          // Dil bilgisi
+          const langMatch = change.translation?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\//) || 
+                           change.url?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\/$/);
+          const langCode = langMatch ? langMatch[1] : 'unknown';
+          const langFlag = langCode === 'en' ? '🇬🇧' : langCode === 'tr' ? '🇹🇷' : '🌐';
+          
           let actionEmoji = '⚡';
           const action = (change.action_name || '').toLowerCase();
           if (action.includes('translation')) actionEmoji = '📝';
@@ -155,12 +236,15 @@ export default async function handler(
           if (action.includes('comment')) actionEmoji = '💬';
           if (action.includes('suggestion')) actionEmoji = '💡';
           if (action.includes('approved')) actionEmoji = '✅';
+          if (action.includes('source')) actionEmoji = '📄';
+          if (action.includes('resource')) actionEmoji = '🔄';
           
           const message = `${emoji} <b>Weblate ${isRecent ? 'Güncellemesi' : 'Son Değişiklik'}</b>\n\n` +
             `📦 <b>Proje:</b> ${project.displayName}\n` +
-            `🧩 <b>Bileşen:</b> ${change.component || 'Bilinmiyor'}\n` +
+            `🧩 <b>Bileşen:</b> ${componentName}\n` +
+            `${langFlag} <b>Dil:</b> ${langCode.toUpperCase()}\n` +
             `${actionEmoji} <b>Aksiyon:</b> ${change.action_name || 'Bilinmiyor'}\n` +
-            `👤 <b>Kullanıcı:</b> ${change.user || 'Anonim'}\n` +
+            `👤 <b>Kullanıcı:</b> ${change.user?.split('/').pop() || 'Anonim'}\n` +
             `🕒 <b>Zaman:</b> ${new Date(change.timestamp).toLocaleString('tr-TR')}\n\n` +
             (change.target ? `📄 <code>${change.target.substring(0, 100)}${change.target.length > 100 ? '...' : ''}</code>\n\n` : '') +
             (change.url ? `🔗 <a href="${change.url}">Detayları Gör</a>` : '');
@@ -171,7 +255,7 @@ export default async function handler(
             totalSent++;
           }
           
-          // Rate limiting - mesajlar arası bekleme
+          // Rate limiting
           if (changesToNotify.length > 1) {
             await new Promise(resolve => setTimeout(resolve, 500));
           }
@@ -182,13 +266,14 @@ export default async function handler(
           success: true,
           changes: sentCount,
           recent: recentChanges.length,
-          total: data.results.length
+          total: data.results.length,
+          filtered_languages: project.languageFilter?.join(', ') || 'all',
+          filtered_components: totalFilteredComp
         });
         
       } catch (error) {
         console.error(`Error processing ${project.slug}:`, error);
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        console.error(`Error details: ${errorMessage}`);
         
         results.push({
           project: project.displayName,
@@ -210,9 +295,11 @@ export default async function handler(
       success: true,
       total_notifications: totalSent,
       total_recent_changes: totalRecent,
+      total_filtered_components: totalFilteredComp,
+      total_filtered_languages: totalFilteredLang,
       projects: results,
       execution_time_ms: executionTime,
-      message: `${totalSent} bildirim gönderildi (${projects.length} proje kontrol edildi)`
+      message: `${totalSent} bildirim gönderildi (${projects.length} proje, sadece İngilizce, sadece proje bileşenleri)`
     });
 
   } catch (error) {
@@ -224,4 +311,4 @@ export default async function handler(
       execution_time_ms: executionTime
     });
   }
-}
+      }
