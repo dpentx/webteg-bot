@@ -1,4 +1,4 @@
-// api/check-rss.ts - Çoklu Proje Desteği (İyileştirilmiş)
+// api/check-rss.ts - Timeout ve Bağlantı İyileştirmesi
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 interface WeblateChange {
@@ -17,63 +17,39 @@ interface Project {
   displayName: string;
 }
 
-// ⏱️ Timeout wrapper
-const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeout = 8000) => {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-  
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (error) {
-    clearTimeout(timeoutId);
-    throw error;
-  }
-};
-
-// 📨 Telegram mesajı gönder (retry mekanizmalı)
+// 📨 Telegram mesajı gönder
 async function sendTelegramMessage(
   botToken: string,
   chatId: string,
-  message: string,
-  retries = 2
+  message: string
 ): Promise<boolean> {
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const response = await fetchWithTimeout(
-        `https://api.telegram.org/bot${botToken}/sendMessage`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: message,
-            parse_mode: 'HTML',
-            disable_web_page_preview: true,
-          }),
-        },
-        5000 // 5 saniye timeout
-      );
-      
-      if (response.ok) return true;
-      
-      const errorData = await response.json();
-      console.error(`Telegram error (attempt ${i + 1}):`, errorData);
-      
-      if (i < retries) {
-        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${botToken}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: message,
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }),
       }
-    } catch (error) {
-      console.error(`Telegram request failed (attempt ${i + 1}):`, error);
-      if (i === retries) return false;
-      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+    );
+    
+    if (response.ok) {
+      console.log('Telegram message sent successfully');
+      return true;
     }
+    
+    const errorData = await response.json();
+    console.error('Telegram error:', errorData);
+    return false;
+  } catch (error) {
+    console.error('Telegram request failed:', error);
+    return false;
   }
-  return false;
 }
 
 export default async function handler(
@@ -83,8 +59,11 @@ export default async function handler(
   const BOT_TOKEN = process.env.BOT_TOKEN;
   const CHAT_ID = process.env.CHAT_ID;
   
+  // 🎯 Takip edilecek projeler
   const projects: Project[] = [
     { slug: 'metrolist', displayName: 'Metrolist' },
+    // Yeni projeler eklemek için:
+    // { slug: 'f-droid', displayName: 'F-Droid' },
   ];
   
   if (!BOT_TOKEN || !CHAT_ID) {
@@ -96,9 +75,7 @@ export default async function handler(
     });
   }
 
-  // ⏰ Başlangıç zamanı - toplam süreyi kontrol et
   const startTime = Date.now();
-  const MAX_EXECUTION_TIME = 9000; // 9 saniye (Vercel limit 10sn)
 
   try {
     let totalSent = 0;
@@ -106,26 +83,23 @@ export default async function handler(
     const results: any[] = [];
     
     for (const project of projects) {
-      // Zaman kontrolü
-      if (Date.now() - startTime > MAX_EXECUTION_TIME) {
-        console.warn('Execution time limit approaching, stopping early');
-        results.push({
-          project: project.displayName,
-          success: false,
-          error: 'Timeout - zaman aşımı'
-        });
-        break;
-      }
-      
       console.log(`Checking project: ${project.displayName} (${project.slug})`);
       
-      const API_URL = `https://hosted.weblate.org/api/changes/?project=${project.slug}`;
+      // API URL'si - limit ekleyerek daha hızlı yanıt alıyoruz
+      const API_URL = `https://hosted.weblate.org/api/changes/?project=${project.slug}&page_size=10`;
       
       try {
-        // ⏱️ Timeout ile fetch
-        const response = await fetchWithTimeout(API_URL, {
-          headers: { 'Accept': 'application/json' }
-        }, 5000);
+        console.log(`Fetching: ${API_URL}`);
+        
+        // Fetch without custom timeout wrapper - let Vercel handle it
+        const response = await fetch(API_URL, {
+          headers: { 
+            'Accept': 'application/json',
+            'User-Agent': 'WebtegBot/1.0'
+          }
+        });
+        
+        console.log(`Response status: ${response.status}`);
         
         if (!response.ok) {
           console.error(`API fetch failed for ${project.slug}: ${response.status}`);
@@ -138,7 +112,7 @@ export default async function handler(
         }
         
         const data = await response.json();
-        console.log(`${project.displayName}: ${data.results?.length || 0} total changes`);
+        console.log(`${project.displayName}: ${data.results?.length || 0} total changes found`);
         
         if (!data.results || data.results.length === 0) {
           results.push({
@@ -150,38 +124,32 @@ export default async function handler(
           continue;
         }
         
-        // Son 2 saat içindeki değişiklikleri filtrele
+        // Son 3 saat içindeki değişiklikleri filtrele (daha geniş)
         const now = new Date();
         const recentChanges = data.results.filter((change: WeblateChange) => {
           const changeTime = new Date(change.timestamp);
           const hoursDiff = (now.getTime() - changeTime.getTime()) / (1000 * 60 * 60);
-          return hoursDiff <= 2;
-        }).slice(0, 5); // Maksimum 5 değişiklik
+          return hoursDiff <= 3; // 3 saat
+        }).slice(0, 3); // Max 3 değişiklik
         
         totalRecent += recentChanges.length;
-        console.log(`${project.displayName}: ${recentChanges.length} recent changes`);
+        console.log(`${project.displayName}: ${recentChanges.length} recent changes (last 3 hours)`);
         
-        // Test için: Son 2 saatte değişiklik yoksa en son 1 değişikliği göster
+        // Test için: Değişiklik yoksa en son 1 değişikliği göster
         const changesToNotify = recentChanges.length > 0 
           ? recentChanges 
           : data.results.slice(0, 1);
         
-        // 🚀 Telegram'a bildirim gönder (paralel)
+        console.log(`Will notify ${changesToNotify.length} changes`);
+        
+        // Telegram'a bildirim gönder
         let sentCount = 0;
-        const sendPromises = changesToNotify.map(async (change, index) => {
-          // Zaman kontrolü
-          if (Date.now() - startTime > MAX_EXECUTION_TIME) {
-            return false;
-          }
-          
-          // Rate limiting için gecikme
-          await new Promise(resolve => setTimeout(resolve, index * 300));
-          
+        for (const change of changesToNotify) {
           const isRecent = recentChanges.length > 0;
           const emoji = isRecent ? '🔔' : '📋';
           
           let actionEmoji = '⚡';
-          const action = change.action_name.toLowerCase();
+          const action = (change.action_name || '').toLowerCase();
           if (action.includes('translation')) actionEmoji = '📝';
           if (action.includes('new')) actionEmoji = '✨';
           if (action.includes('comment')) actionEmoji = '💬';
@@ -191,19 +159,23 @@ export default async function handler(
           const message = `${emoji} <b>Weblate ${isRecent ? 'Güncellemesi' : 'Son Değişiklik'}</b>\n\n` +
             `📦 <b>Proje:</b> ${project.displayName}\n` +
             `🧩 <b>Bileşen:</b> ${change.component || 'Bilinmiyor'}\n` +
-            `${actionEmoji} <b>Aksiyon:</b> ${change.action_name}\n` +
+            `${actionEmoji} <b>Aksiyon:</b> ${change.action_name || 'Bilinmiyor'}\n` +
             `👤 <b>Kullanıcı:</b> ${change.user || 'Anonim'}\n` +
             `🕒 <b>Zaman:</b> ${new Date(change.timestamp).toLocaleString('tr-TR')}\n\n` +
             (change.target ? `📄 <code>${change.target.substring(0, 100)}${change.target.length > 100 ? '...' : ''}</code>\n\n` : '') +
             (change.url ? `🔗 <a href="${change.url}">Detayları Gör</a>` : '');
 
-          return await sendTelegramMessage(BOT_TOKEN!, CHAT_ID!, message);
-        });
-        
-        // Tüm mesajları paralel gönder
-        const sendResults = await Promise.allSettled(sendPromises);
-        sentCount = sendResults.filter(r => r.status === 'fulfilled' && r.value).length;
-        totalSent += sentCount;
+          const sent = await sendTelegramMessage(BOT_TOKEN, CHAT_ID, message);
+          if (sent) {
+            sentCount++;
+            totalSent++;
+          }
+          
+          // Rate limiting - mesajlar arası bekleme
+          if (changesToNotify.length > 1) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
         
         results.push({
           project: project.displayName,
@@ -215,15 +187,18 @@ export default async function handler(
         
       } catch (error) {
         console.error(`Error processing ${project.slug}:`, error);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        console.error(`Error details: ${errorMessage}`);
+        
         results.push({
           project: project.displayName,
           success: false,
-          error: error instanceof Error ? error.message : 'Unknown error'
+          error: errorMessage
         });
       }
       
-      // Projeler arası bekleme (zaman varsa)
-      if (projects.length > 1 && Date.now() - startTime < MAX_EXECUTION_TIME - 1000) {
+      // Projeler arası bekleme
+      if (projects.length > 1) {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
