@@ -1,18 +1,16 @@
-// watch/watch.js
+// watch/watch.ts
 // Takip edilecek Weblate projelerinin listesi
 
-/**
- * @typedef {Object} WatchedProject
- * @property {string} slug - Weblate'teki proje slug'ı (URL'den)
- * @property {string} displayName - Telegram mesajlarında görünecek isim
- * @property {string} [emoji] - Proje için özel emoji (opsiyonel)
- */
+export interface WatchedProject {
+  slug: string;        // Weblate'teki proje slug'ı (URL'den)
+  displayName: string; // Telegram mesajlarında görünecek isim
+  emoji?: string;      // Proje için özel emoji (opsiyonel)
+}
 
 /**
  * Takip edilen projeler
- * @type {WatchedProject[]}
  */
-const watchedProjects = [
+export const watchedProjects: WatchedProject[] = [
   {
     slug: 'metrolist',
     displayName: 'Metrolist',
@@ -39,48 +37,37 @@ const watchedProjects = [
 
 /**
  * Proje slug'ını al
- * @param {string} url - Weblate proje URL'i
- * @returns {string} Proje slug'ı
+ * @param url - Weblate proje URL'i
+ * @returns Proje slug'ı
  * 
  * Örnek: 
  * getSlugFromUrl('https://hosted.weblate.org/projects/metrolist/') 
  * // returns 'metrolist'
  */
-function getSlugFromUrl(url) {
+export function getSlugFromUrl(url: string): string | null {
   const match = url.match(/projects\/([^/]+)/);
   return match ? match[1] : null;
 }
 
 /**
  * Tüm takip edilen projeleri döndür
- * @returns {WatchedProject[]}
  */
-function getWatchedProjects() {
+export function getWatchedProjects(): WatchedProject[] {
   return watchedProjects;
 }
 
 /**
  * Bir proje takip ediliyor mu kontrol et
- * @param {string} slug - Proje slug'ı
- * @returns {boolean}
+ * @param slug - Proje slug'ı
  */
-function isProjectWatched(slug) {
+export function isProjectWatched(slug: string): boolean {
   return watchedProjects.some(p => p.slug === slug);
 }
 
 /**
  * Proje bilgilerini slug ile al
- * @param {string} slug - Proje slug'ı
- * @returns {WatchedProject|null}
+ * @param slug - Proje slug'ı
  */
-function getProjectBySlug(slug) {
+export function getProjectBySlug(slug: string): WatchedProject | null {
   return watchedProjects.find(p => p.slug === slug) || null;
 }
-
-module.exports = {
-  watchedProjects,
-  getSlugFromUrl,
-  getWatchedProjects,
-  isProjectWatched,
-  getProjectBySlug
-};
