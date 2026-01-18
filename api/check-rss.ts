@@ -1,5 +1,8 @@
-// api/check-rss.ts - Weblate API Key ile Kişisel Takip
+// api/check-rss.ts - Modüler Versiyon
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+
+// Watch listesini import et
+const { getWatchedProjects } = require('../watch/watch.js');
 
 interface WeblateChange {
   id: number;
@@ -10,20 +13,12 @@ interface WeblateChange {
   user: string;
   component: string;
   url: string;
-  language?: string;
 }
 
-interface Subscription {
-  scope: number;
-  frequency: string;
-  project: {
-    name: string;
-    slug: string;
-  };
-  component?: {
-    name: string;
-    slug: string;
-  };
+interface WatchedProject {
+  slug: string;
+  displayName: string;
+  emoji?: string;
 }
 
 // 📨 Telegram mesajı gönder
@@ -61,52 +56,12 @@ async function sendTelegramMessage(
   }
 }
 
-// 🔍 Kullanıcının takip ettiği projeleri al
-async function getUserSubscriptions(apiKey: string): Promise<Subscription[]> {
-  try {
-    const url = 'https://hosted.weblate.org/api/user/subscriptions/';
-    console.log('Fetching user subscriptions...');
-    
-    const response = await fetch(url, {
-      headers: { 
-        'Accept': 'application/json',
-        'Authorization': `Token ${apiKey}`,
-        'User-Agent': 'WebtegBot/1.0'
-      }
-    });
-    
-    if (!response.ok) {
-      console.error(`Failed to fetch subscriptions: ${response.status}`);
-      return [];
-    }
-    
-    const data = await response.json();
-    const subscriptions = data.results || [];
-    console.log(`Found ${subscriptions.length} subscriptions`);
-    
-    // Sadece proje bazlı takipleri al (component bazlı olanları filtrele)
-    const projectSubs = subscriptions.filter((sub: Subscription) => 
-      sub.project && !sub.component
-    );
-    
-    console.log('Subscribed projects:', 
-      projectSubs.map((s: Subscription) => s.project.slug).join(', ')
-    );
-    
-    return projectSubs;
-  } catch (error) {
-    console.error('Error fetching subscriptions:', error);
-    return [];
-  }
-}
-
 export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ) {
   const BOT_TOKEN = process.env.BOT_TOKEN;
   const CHAT_ID = process.env.CHAT_ID;
-  const WEBLATE_API_KEY = process.env.WEBLATE_API_KEY;
   
   if (!BOT_TOKEN || !CHAT_ID) {
     console.error('Missing BOT_TOKEN or CHAT_ID');
@@ -117,57 +72,50 @@ export default async function handler(
     });
   }
 
-  if (!WEBLATE_API_KEY) {
-    console.error('Missing WEBLATE_API_KEY');
-    return res.status(500).json({ 
-      error: 'Missing WEBLATE_API_KEY',
-      message: 'Lütfen Vercel environment variables\'a WEBLATE_API_KEY ekleyin'
-    });
-  }
-
   const startTime = Date.now();
 
   try {
-    // Kullanıcının takip ettiği projeleri al
-    const subscriptions = await getUserSubscriptions(WEBLATE_API_KEY);
+    // Watch listesinden projeleri al
+    const projects: WatchedProject[] = getWatchedProjects();
     
-    if (subscriptions.length === 0) {
+    if (projects.length === 0) {
       return res.status(200).json({
         success: true,
-        message: 'Takip edilen proje bulunamadı. Weblate\'te proje takip etmeyi deneyin.',
+        message: 'watch/watch.js dosyasında takip edilen proje yok',
         total_notifications: 0,
         projects: []
       });
     }
     
+    console.log(`Checking ${projects.length} watched projects:`, 
+      projects.map(p => p.slug).join(', ')
+    );
+    
     let totalSent = 0;
     let totalRecent = 0;
     const results: any[] = [];
     
-    // Her takip edilen proje için
-    for (const subscription of subscriptions) {
-      const projectSlug = subscription.project.slug;
-      const projectName = subscription.project.name;
-      
-      console.log(`\n=== Checking subscribed project: ${projectName} (${projectSlug}) ===`);
+    for (const project of projects) {
+      console.log(`\n=== Checking project: ${project.displayName} (${project.slug}) ===`);
       
       try {
         // Proje değişikliklerini çek (sadece İngilizce)
-        const API_URL = `https://hosted.weblate.org/api/changes/?project=${projectSlug}&language=en&page_size=10`;
+        const API_URL = `https://hosted.weblate.org/api/changes/?project=${project.slug}&language=en&page_size=10`;
         console.log(`Fetching: ${API_URL}`);
         
         const response = await fetch(API_URL, {
           headers: { 
             'Accept': 'application/json',
-            'Authorization': `Token ${WEBLATE_API_KEY}`,
             'User-Agent': 'WebtegBot/1.0'
           }
         });
         
+        console.log(`Response status: ${response.status}`);
+        
         if (!response.ok) {
-          console.error(`API fetch failed for ${projectSlug}: ${response.status}`);
+          console.error(`API fetch failed for ${project.slug}: ${response.status}`);
           results.push({
-            project: projectName,
+            project: project.displayName,
             success: false,
             error: `HTTP ${response.status}`
           });
@@ -176,11 +124,11 @@ export default async function handler(
         
         const data = await response.json();
         const changes = data.results || [];
-        console.log(`${projectName}: ${changes.length} English changes found`);
+        console.log(`${project.displayName}: ${changes.length} English changes found`);
         
         if (changes.length === 0) {
           results.push({
-            project: projectName,
+            project: project.displayName,
             success: true,
             changes: 0,
             message: 'Değişiklik yok'
@@ -197,7 +145,7 @@ export default async function handler(
         }).slice(0, 5);
         
         totalRecent += recentChanges.length;
-        console.log(`${projectName}: ${recentChanges.length} recent changes (last 3 hours)`);
+        console.log(`${project.displayName}: ${recentChanges.length} recent changes (last 3 hours)`);
         
         // Test için: Değişiklik yoksa en son 1 değişikliği göster
         const changesToNotify = recentChanges.length > 0 
@@ -219,7 +167,7 @@ export default async function handler(
           const langMatch = change.translation?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\//) || 
                            change.url?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\/$/);
           const langCode = langMatch ? langMatch[1] : 'en';
-          const langFlag = '🇬🇧'; // Sadece İngilizce
+          const langFlag = '🇬🇧';
           
           let actionEmoji = '⚡';
           const action = (change.action_name || '').toLowerCase();
@@ -236,8 +184,11 @@ export default async function handler(
           // Kullanıcı adını temizle
           const userName = change.user?.split('/').filter(Boolean).pop()?.replace(/:/g, ' ') || 'Anonim';
           
+          // Proje emoji'si varsa kullan
+          const projectEmoji = project.emoji || '📦';
+          
           const message = `${emoji} <b>Weblate ${isRecent ? 'Güncellemesi' : 'Son Değişiklik'}</b>\n\n` +
-            `📦 <b>Proje:</b> ${projectName}\n` +
+            `${projectEmoji} <b>Proje:</b> ${project.displayName}\n` +
             `🧩 <b>Bileşen:</b> ${componentName}\n` +
             `${langFlag} <b>Dil:</b> ${langCode.toUpperCase()}\n` +
             `${actionEmoji} <b>Aksiyon:</b> ${change.action_name || 'Bilinmiyor'}\n` +
@@ -259,7 +210,7 @@ export default async function handler(
         }
         
         results.push({
-          project: projectName,
+          project: project.displayName,
           success: true,
           changes: sentCount,
           recent: recentChanges.length,
@@ -267,16 +218,16 @@ export default async function handler(
         });
         
       } catch (error) {
-        console.error(`Error processing ${projectSlug}:`, error);
+        console.error(`Error processing ${project.slug}:`, error);
         results.push({
-          project: projectName,
+          project: project.displayName,
           success: false,
           error: error instanceof Error ? error.message : 'Unknown error'
         });
       }
       
       // Projeler arası bekleme
-      if (subscriptions.length > 1) {
+      if (projects.length > 1) {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
@@ -288,10 +239,10 @@ export default async function handler(
       success: true,
       total_notifications: totalSent,
       total_recent_changes: totalRecent,
-      subscribed_projects: subscriptions.length,
+      projects_checked: projects.length,
       projects: results,
       execution_time_ms: executionTime,
-      message: `${totalSent} bildirim gönderildi (${subscriptions.length} takip edilen proje)`
+      message: `${totalSent} bildirim gönderildi (${projects.length} proje, sadece İngilizce)`
     });
 
   } catch (error) {
