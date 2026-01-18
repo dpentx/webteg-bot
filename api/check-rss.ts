@@ -1,8 +1,6 @@
-// api/check-rss.ts - Modüler Versiyon
+// api/check-rss.ts - Düzeltilmiş Import
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-
-// Watch listesini import et
-const { getWatchedProjects } = require('../watch/watch.js');
+import { getWatchedProjects, type WatchedProject } from '../watch/watch';
 
 interface WeblateChange {
   id: number;
@@ -13,12 +11,6 @@ interface WeblateChange {
   user: string;
   component: string;
   url: string;
-}
-
-interface WatchedProject {
-  slug: string;
-  displayName: string;
-  emoji?: string;
 }
 
 // 📨 Telegram mesajı gönder
@@ -81,7 +73,7 @@ export default async function handler(
     if (projects.length === 0) {
       return res.status(200).json({
         success: true,
-        message: 'watch/watch.js dosyasında takip edilen proje yok',
+        message: 'watch/watch.ts dosyasında takip edilen proje yok',
         total_notifications: 0,
         projects: []
       });
@@ -254,4 +246,4 @@ export default async function handler(
       execution_time_ms: executionTime
     });
   }
-  }
+          }
