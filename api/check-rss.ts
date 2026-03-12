@@ -1,6 +1,6 @@
 // api/check-rss.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getWatchedProjects, type WatchedProject } from '../watch/watch';
+import { getWatchedProjects, type WatchedProject } from '../watch/watch.js';
 
 interface WeblateChange {
   id: number;
