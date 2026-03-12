@@ -1,6 +1,5 @@
 // api/check-rss.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { kv } from '@vercel/kv';
 import { getWatchedProjects, type WatchedProject } from '../watch/watch';
 
 interface WeblateChange {
@@ -12,6 +11,35 @@ interface WeblateChange {
   user: string;
   component: string;
   url: string;
+}
+
+// Upstash REST API — @vercel/kv paketi gerektirmez
+async function kvGet(key: string): Promise<number> {
+  const url = process.env.KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return 0;
+  try {
+    const res = await fetch(`${url}/get/${key}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await res.json();
+    return data.result ? parseInt(data.result, 10) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function kvSet(key: string, value: number): Promise<void> {
+  const url = process.env.KV_REST_API_URL;
+  const token = process.env.KV_REST_API_TOKEN;
+  if (!url || !token) return;
+  try {
+    await fetch(`${url}/set/${key}/${value}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch (e) {
+    console.error('KV set failed:', e);
+  }
 }
 
 async function sendTelegramMessage(
@@ -33,12 +61,7 @@ async function sendTelegramMessage(
         }),
       }
     );
-
-    if (response.ok) {
-      console.log('Telegram message sent successfully');
-      return true;
-    }
-
+    if (response.ok) return true;
     const errorData = await response.json();
     console.error('Telegram error:', errorData);
     return false;
@@ -48,20 +71,12 @@ async function sendTelegramMessage(
   }
 }
 
-export default async function handler(
-  req: VercelRequest,
-  res: VercelResponse
-) {
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   const BOT_TOKEN = process.env.BOT_TOKEN;
   const CHAT_ID = process.env.CHAT_ID;
 
   if (!BOT_TOKEN || !CHAT_ID) {
-    console.error('Missing BOT_TOKEN or CHAT_ID');
-    return res.status(500).json({
-      error: 'Missing configuration',
-      has_token: !!BOT_TOKEN,
-      has_chat_id: !!CHAT_ID,
-    });
+    return res.status(500).json({ error: 'Missing BOT_TOKEN or CHAT_ID' });
   }
 
   const startTime = Date.now();
@@ -70,93 +85,46 @@ export default async function handler(
     const projects: WatchedProject[] = getWatchedProjects();
 
     if (projects.length === 0) {
-      return res.status(200).json({
-        success: true,
-        message: 'watch/watch.ts dosyasında takip edilen proje yok',
-        total_notifications: 0,
-        projects: [],
-      });
+      return res.status(200).json({ success: true, message: 'Takip edilen proje yok' });
     }
-
-    console.log(
-      `Checking ${projects.length} watched projects:`,
-      projects.map((p) => p.slug).join(', ')
-    );
 
     let totalSent = 0;
     const results: any[] = [];
 
     for (const project of projects) {
-      console.log(`\n=== Checking project: ${project.displayName} (${project.slug}) ===`);
+      console.log(`=== Checking: ${project.displayName} (${project.slug}) ===`);
 
       try {
-        // KV'den bu proje için en son görülen change ID'sini al
-        const kvKey = `last_change_id:${project.slug}`;
-        const lastSeenId: number = (await kv.get<number>(kvKey)) ?? 0;
-        console.log(`Last seen change ID for ${project.slug}: ${lastSeenId}`);
+        const kvKey = `last_change_id_${project.slug}`;
+        const lastSeenId = await kvGet(kvKey);
+        console.log(`Last seen ID: ${lastSeenId}`);
 
         const API_URL = `https://hosted.weblate.org/api/changes/?project=${project.slug}&language=en&page_size=20&ordering=-id`;
-        console.log(`Fetching: ${API_URL}`);
-
         const response = await fetch(API_URL, {
-          headers: {
-            Accept: 'application/json',
-            'User-Agent': 'WebtegBot/1.0',
-          },
+          headers: { Accept: 'application/json', 'User-Agent': 'WebtegBot/1.0' },
         });
 
-        console.log(`Response status: ${response.status}`);
-
         if (!response.ok) {
-          console.error(`API fetch failed for ${project.slug}: ${response.status}`);
-          results.push({
-            project: project.displayName,
-            success: false,
-            error: `HTTP ${response.status}`,
-          });
+          results.push({ project: project.displayName, success: false, error: `HTTP ${response.status}` });
           continue;
         }
 
         const data = await response.json();
         const allChanges: WeblateChange[] = data.results || [];
-        console.log(`${project.displayName}: ${allChanges.length} changes fetched`);
 
-        if (allChanges.length === 0) {
-          results.push({
-            project: project.displayName,
-            success: true,
-            changes_sent: 0,
-            message: 'API boş döndü',
-          });
-          continue;
-        }
-
-        // Sadece daha önce görülmemiş (ID > lastSeenId) değişiklikleri al
-        // API zaten ID azalan sırada geliyor; yeniden eskiye doğru işlemek için tersine çevir
-        const newChanges = allChanges
-          .filter((c) => c.id > lastSeenId)
-          .reverse(); // Eskiden yeniye sırala, böylece mesajlar kronolojik gelir
-
-        console.log(`${project.displayName}: ${newChanges.length} new changes (ID > ${lastSeenId})`);
+        const newChanges = allChanges.filter((c) => c.id > lastSeenId).reverse();
+        console.log(`${project.displayName}: ${newChanges.length} new changes`);
 
         if (newChanges.length === 0) {
-          results.push({
-            project: project.displayName,
-            success: true,
-            changes_sent: 0,
-            message: 'Yeni değişiklik yok',
-          });
+          results.push({ project: project.displayName, success: true, changes_sent: 0, message: 'Yeni değişiklik yok' });
           continue;
         }
 
-        // En fazla 5 bildirim gönder (spam önleme)
         const changesToSend = newChanges.slice(0, 5);
         let sentCount = 0;
 
         for (const change of changesToSend) {
-          const componentName =
-            change.component?.split('/').filter(Boolean).pop() || 'Bilinmiyor';
-
+          const componentName = change.component?.split('/').filter(Boolean).pop() || 'Bilinmiyor';
           const langMatch =
             change.translation?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\//) ||
             change.url?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\/$/);
@@ -174,9 +142,7 @@ export default async function handler(
           if (action.includes('pushed')) actionEmoji = '⬆️';
 
           const userName =
-            change.user?.split('/').filter(Boolean).pop()?.replace(/:/g, ' ') ||
-            'Anonim';
-
+            change.user?.split('/').filter(Boolean).pop()?.replace(/:/g, ' ') || 'Anonim';
           const projectEmoji = project.emoji || '📦';
 
           const message =
@@ -193,29 +159,22 @@ export default async function handler(
             (change.url ? `🔗 <a href="${change.url}">Detayları Gör</a>` : '');
 
           const sent = await sendTelegramMessage(BOT_TOKEN, CHAT_ID, message);
-          if (sent) {
-            sentCount++;
-            totalSent++;
-          }
-
-          if (changesToSend.length > 1) {
-            await new Promise((resolve) => setTimeout(resolve, 500));
-          }
+          if (sent) { sentCount++; totalSent++; }
+          if (changesToSend.length > 1) await new Promise((r) => setTimeout(r, 500));
         }
 
-        // En yüksek ID'yi KV'ye kaydet (tüm yeni değişiklikler işlendi)
         const maxId = Math.max(...newChanges.map((c) => c.id));
-        await kv.set(kvKey, maxId);
-        console.log(`Updated last seen ID for ${project.slug}: ${maxId}`);
+        await kvSet(kvKey, maxId);
+        console.log(`Updated last ID: ${maxId}`);
 
-        // Eğer 5'ten fazla yeni değişiklik varsa özet mesajı gönder
         const skipped = newChanges.length - changesToSend.length;
         if (skipped > 0) {
-          const summaryMsg =
-            `ℹ️ <b>${project.displayName}</b>: Toplam ${newChanges.length} yeni değişiklik vardı, ` +
-            `${skipped} tanesi gösterilmedi (spam önleme). ` +
-            `<a href="https://hosted.weblate.org/projects/${project.slug}/">Tümünü Weblate'te gör</a>`;
-          await sendTelegramMessage(BOT_TOKEN, CHAT_ID, summaryMsg);
+          await sendTelegramMessage(
+            BOT_TOKEN,
+            CHAT_ID,
+            `ℹ️ <b>${project.displayName}</b>: ${newChanges.length} yeni değişiklik, ${skipped} tanesi gösterilmedi. ` +
+              `<a href="https://hosted.weblate.org/projects/${project.slug}/">Tümünü gör</a>`
+          );
         }
 
         results.push({
@@ -223,39 +182,31 @@ export default async function handler(
           success: true,
           new_changes: newChanges.length,
           changes_sent: sentCount,
-          new_last_id: maxId,
         });
       } catch (error) {
         console.error(`Error processing ${project.slug}:`, error);
         results.push({
           project: project.displayName,
           success: false,
-          error: error instanceof Error ? error.message : 'Unknown error',
+          error: error instanceof Error ? error.message : 'Unknown',
         });
       }
 
-      if (projects.length > 1) {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
+      if (projects.length > 1) await new Promise((r) => setTimeout(r, 500));
     }
-
-    const executionTime = Date.now() - startTime;
-    console.log(`\n=== Execution completed in ${executionTime}ms ===`);
 
     return res.status(200).json({
       success: true,
       total_notifications: totalSent,
       projects_checked: projects.length,
       projects: results,
-      execution_time_ms: executionTime,
+      execution_time_ms: Date.now() - startTime,
     });
   } catch (error) {
-    const executionTime = Date.now() - startTime;
-    console.error('Global error:', error);
     return res.status(500).json({
       error: 'Check failed',
-      details: error instanceof Error ? error.message : 'Unknown error',
-      execution_time_ms: executionTime,
+      details: error instanceof Error ? error.message : 'Unknown',
+      execution_time_ms: Date.now() - startTime,
     });
   }
 }
