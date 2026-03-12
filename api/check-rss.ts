@@ -17,14 +17,19 @@ interface WeblateChange {
 async function kvGet(key: string): Promise<number> {
   const url = process.env.KV_REST_API_URL;
   const token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return 0;
+  if (!url || !token) {
+    console.warn('KV env variables eksik (KV_REST_API_URL / KV_REST_API_TOKEN)');
+    return 0;
+  }
   try {
     const res = await fetch(`${url}/get/${key}`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(4000),
     });
     const data = await res.json();
     return data.result ? parseInt(data.result, 10) : 0;
-  } catch {
+  } catch (e) {
+    console.error('KV get failed:', e);
     return 0;
   }
 }
@@ -36,6 +41,7 @@ async function kvSet(key: string, value: number): Promise<void> {
   try {
     await fetch(`${url}/set/${key}/${value}`, {
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(4000),
     });
   } catch (e) {
     console.error('KV set failed:', e);
@@ -59,6 +65,7 @@ async function sendTelegramMessage(
           parse_mode: 'HTML',
           disable_web_page_preview: true,
         }),
+        signal: AbortSignal.timeout(8000),
       }
     );
     if (response.ok) return true;
@@ -69,6 +76,43 @@ async function sendTelegramMessage(
     console.error('Telegram request failed:', error);
     return false;
   }
+}
+
+async function fetchWeblateChanges(slug: string): Promise<WeblateChange[] | null> {
+  const API_URL = `https://hosted.weblate.org/api/changes/?project=${slug}&language=en&page_size=20&ordering=-id`;
+
+  // Weblate, Cloudflare arkasında — tarayıcıya benzer header'lar gönderiyoruz
+  const response = await fetch(API_URL, {
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (compatible; WebtegBot/1.0; +https://github.com/dpentx/webteg-bot)',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+
+  console.log(`Weblate API status for ${slug}: ${response.status}`);
+
+  // Cloudflare challenge veya rate limit
+  if (response.status === 403 || response.status === 429) {
+    console.warn(`Weblate DDoS koruması devrede (${response.status}) — ${slug} atlanıyor`);
+    return null;
+  }
+
+  if (!response.ok) {
+    console.error(`Weblate API hatası: ${response.status}`);
+    return null;
+  }
+
+  // HTML döndüyse (Cloudflare challenge sayfası) yakala
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    console.warn(`Weblate JSON dönmedi (content-type: ${contentType}) — muhtemelen Cloudflare challenge`);
+    return null;
+  }
+
+  const data = await response.json();
+  return data.results || [];
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -88,32 +132,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(200).json({ success: true, message: 'Takip edilen proje yok' });
     }
 
+    console.log(`${projects.length} proje kontrol ediliyor: ${projects.map(p => p.slug).join(', ')}`);
+
     let totalSent = 0;
     const results: any[] = [];
 
     for (const project of projects) {
-      console.log(`=== Checking: ${project.displayName} (${project.slug}) ===`);
+      console.log(`\n=== Checking: ${project.displayName} (${project.slug}) ===`);
 
       try {
         const kvKey = `last_change_id_${project.slug}`;
         const lastSeenId = await kvGet(kvKey);
         console.log(`Last seen ID: ${lastSeenId}`);
 
-        const API_URL = `https://hosted.weblate.org/api/changes/?project=${project.slug}&language=en&page_size=20&ordering=-id`;
-        const response = await fetch(API_URL, {
-          headers: { Accept: 'application/json', 'User-Agent': 'WebtegBot/1.0' },
-        });
+        const allChanges = await fetchWeblateChanges(project.slug);
 
-        if (!response.ok) {
-          results.push({ project: project.displayName, success: false, error: `HTTP ${response.status}` });
+        if (allChanges === null) {
+          // DDoS koruması veya başka hata — bu seferi atla, ID'yi güncelleme
+          results.push({
+            project: project.displayName,
+            success: false,
+            error: 'Weblate erişilemedi (DDoS koruması veya hata)',
+          });
           continue;
         }
 
-        const data = await response.json();
-        const allChanges: WeblateChange[] = data.results || [];
+        if (allChanges.length === 0) {
+          results.push({ project: project.displayName, success: true, changes_sent: 0, message: 'Değişiklik yok' });
+          continue;
+        }
+
+        // İlk çalışmada (lastSeenId === 0) tüm değişiklikleri yeni sayma,
+        // sadece en yüksek ID'yi kaydet ve bir sonraki çalışmaya bırak
+        if (lastSeenId === 0) {
+          const maxId = Math.max(...allChanges.map((c) => c.id));
+          await kvSet(kvKey, maxId);
+          console.log(`İlk çalışma — mevcut max ID kaydedildi: ${maxId}, bildirim gönderilmedi`);
+          results.push({
+            project: project.displayName,
+            success: true,
+            changes_sent: 0,
+            message: `İlk çalışma, başlangıç ID kaydedildi: ${maxId}`,
+          });
+          continue;
+        }
 
         const newChanges = allChanges.filter((c) => c.id > lastSeenId).reverse();
-        console.log(`${project.displayName}: ${newChanges.length} new changes`);
+        console.log(`${project.displayName}: ${newChanges.length} yeni değişiklik (ID > ${lastSeenId})`);
 
         if (newChanges.length === 0) {
           results.push({ project: project.displayName, success: true, changes_sent: 0, message: 'Yeni değişiklik yok' });
@@ -124,7 +189,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         let sentCount = 0;
 
         for (const change of changesToSend) {
-          const componentName = change.component?.split('/').filter(Boolean).pop() || 'Bilinmiyor';
+          const componentName =
+            change.component?.split('/').filter(Boolean).pop() || 'Bilinmiyor';
           const langMatch =
             change.translation?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\//) ||
             change.url?.match(/\/([a-z]{2}(?:_[A-Z]{2})?)\/$/);
@@ -160,7 +226,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
           const sent = await sendTelegramMessage(BOT_TOKEN, CHAT_ID, message);
           if (sent) { sentCount++; totalSent++; }
-          if (changesToSend.length > 1) await new Promise((r) => setTimeout(r, 500));
+          if (changesToSend.length > 1) await new Promise((r) => setTimeout(r, 600));
         }
 
         const maxId = Math.max(...newChanges.map((c) => c.id));
@@ -172,7 +238,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           await sendTelegramMessage(
             BOT_TOKEN,
             CHAT_ID,
-            `ℹ️ <b>${project.displayName}</b>: ${newChanges.length} yeni değişiklik, ${skipped} tanesi gösterilmedi. ` +
+            `ℹ️ <b>${project.displayName}</b>: ${newChanges.length} yeni değişiklik, ` +
+              `${skipped} tanesi gösterilmedi (spam önleme).\n` +
               `<a href="https://hosted.weblate.org/projects/${project.slug}/">Tümünü gör</a>`
           );
         }
