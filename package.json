@@ -5,6 +5,9 @@
   "scripts": {
     "dev": "vercel dev"
   },
+  "dependencies": {
+    "@vercel/kv": "^1.0.0"
+  },
   "devDependencies": {
     "@vercel/node": "^3.0.0",
     "typescript": "^5.0.0"
