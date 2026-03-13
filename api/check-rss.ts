@@ -1,13 +1,13 @@
-// api/check-rss.ts — RSS tabanlı, Weblate API'si kullanmıyor
+// api/check-rss.ts — RSS tabanlı, sadece TR ve EN bildirimleri
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { getWatchedProjects, type WatchedProject } from '../watch/watch.js';
 
 interface RssItem {
-  title: string;       // "Çeviri değiştirildi"
-  link: string;        // https://hosted.weblate.org/translate/...
-  description: string; // HTML içerikli açıklama
-  pubDate: string;     // "Thu, 12 Mar 2026 19:53:45 +0000"
-  guid: string;        // tekil tanımlayıcı (link ile aynı genellikle)
+  title: string;
+  link: string;
+  description: string;
+  pubDate: string;
+  guid: string;
 }
 
 // --- KV helpers (Upstash REST, paket gerektirmez) ---
@@ -57,7 +57,6 @@ async function fetchRss(slug: string): Promise<RssItem[] | null> {
     });
     console.log(`RSS fetch status for ${slug}: ${res.status}`);
     if (!res.ok) { console.error(`RSS fetch failed: ${res.status}`); return null; }
-
     const xml = await res.text();
     return parseRss(xml);
   } catch (e) {
@@ -67,7 +66,6 @@ async function fetchRss(slug: string): Promise<RssItem[] | null> {
 }
 
 function extractTag(xml: string, tag: string): string {
-  // CDATA veya düz metin — her ikisini de yakala
   const cdataMatch = xml.match(new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`, 'i'));
   if (cdataMatch) return cdataMatch[1].trim();
   const plainMatch = xml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, 'i'));
@@ -91,18 +89,32 @@ function parseRss(xml: string): RssItem[] {
   return items;
 }
 
-// --- RSS description'dan bilgi çıkar ---
+// --- Filtre: sadece TR veya EN ilgili itemlar ---
+// EN: yeni kaynak string eklenmiş (çevrilmesi gereken yeni içerik)
+// TR: Türkçe çeviriye dokunulmuş
+function isRelevant(item: RssItem): boolean {
+  const link = item.link.toLowerCase();
+  const desc = item.description.toLowerCase();
+
+  // Link'te /tr/ veya /en/ geçiyorsa ilgili
+  if (link.includes('/tr/') || link.includes('/en/')) return true;
+
+  // Description'da dil adı geçiyorsa (bazı item'larda link dil içermez)
+  if (desc.includes('türkçe') || desc.includes('turkish')) return true;
+  if (desc.includes('i̇ngilizce') || desc.includes('english')) return true;
+
+  return false;
+}
+
+// --- Description parse ---
 
 function parseDescription(desc: string): { user: string; component: string; lang: string } {
-  // HTML entity decode
   const decoded = desc
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
 
-  // Kullanıcı adı: <span>dpentx</span>
   const userMatch = decoded.match(/<span>([^<]+)<\/span>/);
   const user = userMatch ? userMatch[1] : 'Anonim';
 
-  // Bileşen ve dil: "Metrolist/Metrolist-specific strings — Türkçe dilinde"
   const compLangMatch = decoded.match(/tarafından ([^—]+)—\s*([^\s]+(?:\s[^\s]+)?)\s+dilinde/);
   const component = compLangMatch ? compLangMatch[1].trim() : '';
   const lang      = compLangMatch ? compLangMatch[2].trim() : '';
@@ -138,16 +150,15 @@ function buildMessage(item: RssItem, project: WatchedProject): string {
   const { user, component, lang } = parseDescription(item.description);
   const projectEmoji = project.emoji || '📦';
 
-  // Aksiyon emoji
   const t = item.title.toLowerCase();
   let actionEmoji = '⚡';
-  if (t.includes('eklendi') || t.includes('added'))      actionEmoji = '✨';
+  if (t.includes('eklendi') || t.includes('added'))        actionEmoji = '✨';
   if (t.includes('değiştirildi') || t.includes('changed')) actionEmoji = '🔄';
   if (t.includes('tamamlandı') || t.includes('completed')) actionEmoji = '✅';
-  if (t.includes('onaylandı') || t.includes('approved'))  actionEmoji = '👍';
-  if (t.includes('yorum') || t.includes('comment'))       actionEmoji = '💬';
-  if (t.includes('öneri') || t.includes('suggestion'))    actionEmoji = '💡';
-  if (t.includes('itildi') || t.includes('pushed'))       actionEmoji = '⬆️';
+  if (t.includes('onaylandı') || t.includes('approved'))   actionEmoji = '👍';
+  if (t.includes('yorum') || t.includes('comment'))        actionEmoji = '💬';
+  if (t.includes('öneri') || t.includes('suggestion'))     actionEmoji = '💡';
+  if (t.includes('itildi') || t.includes('pushed'))        actionEmoji = '⬆️';
 
   const time = new Date(item.pubDate).toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
 
@@ -186,10 +197,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     console.log(`\n=== ${project.displayName} (${project.slug}) ===`);
 
     try {
-      // KV'den son görülen pubDate timestamp'ini al
       const kvKey      = `rss_last_ts_${project.slug}`;
       const lastSeenTs = await kvGet(kvKey);
-      console.log(`Last seen timestamp: ${lastSeenTs} (${lastSeenTs ? new Date(lastSeenTs).toISOString() : 'hiç görülmedi'})`);
+      console.log(`Last seen timestamp: ${lastSeenTs}`);
 
       const items = await fetchRss(project.slug);
       if (!items) {
@@ -202,31 +212,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         continue;
       }
 
-      // En yüksek pubDate timestamp'ini bul
       const maxTs = Math.max(...items.map(i => new Date(i.pubDate).getTime()));
 
-      // İlk çalışma: spam yapmadan sadece mevcut max timestamp'i kaydet
+      // İlk çalışma
       if (lastSeenTs === 0) {
         await kvSet(kvKey, maxTs);
-        console.log(`İlk çalışma — başlangıç timestamp kaydedildi: ${new Date(maxTs).toISOString()}`);
+        console.log(`İlk çalışma — başlangıç timestamp kaydedildi`);
         results.push({ project: project.displayName, success: true, changes_sent: 0, message: 'İlk çalışma, başlangıç noktası kaydedildi' });
         continue;
       }
 
-      // Sadece lastSeenTs'den sonraki itemları al, eskiden yeniye sırala
+      // Yeni itemlar — önce zaman filtresi, sonra dil filtresi
       const newItems = items
         .filter(i => new Date(i.pubDate).getTime() > lastSeenTs)
         .sort((a, b) => new Date(a.pubDate).getTime() - new Date(b.pubDate).getTime());
 
-      console.log(`${newItems.length} yeni item`);
+      const relevantItems = newItems.filter(isRelevant);
 
-      if (newItems.length === 0) {
-        results.push({ project: project.displayName, success: true, changes_sent: 0, message: 'Yeni değişiklik yok' });
+      console.log(`${newItems.length} yeni item, ${relevantItems.length} tanesi TR/EN ilgili`);
+
+      // Timestamp'i her zaman güncelle (alakasız dilleri de geç)
+      if (newItems.length > 0) {
+        await kvSet(kvKey, maxTs);
+      }
+
+      if (relevantItems.length === 0) {
+        results.push({ project: project.displayName, success: true, changes_sent: 0, message: `${newItems.length} yeni item var ama TR/EN değil, atlandı` });
         continue;
       }
 
-      // En fazla 5 bildirim (spam önleme)
-      const toSend  = newItems.slice(0, 5);
+      const toSend  = relevantItems.slice(0, 5);
       let sentCount = 0;
 
       for (const item of toSend) {
@@ -236,20 +251,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         if (toSend.length > 1) await new Promise(r => setTimeout(r, 600));
       }
 
-      // KV'yi güncelle
-      await kvSet(kvKey, maxTs);
-      console.log(`Updated timestamp: ${new Date(maxTs).toISOString()}`);
-
-      const skipped = newItems.length - toSend.length;
+      const skipped = relevantItems.length - toSend.length;
       if (skipped > 0) {
         await sendTelegramMessage(BOT_TOKEN, CHAT_ID,
-          `ℹ️ <b>${project.displayName}</b>: ${newItems.length} yeni değişiklik, ` +
+          `ℹ️ <b>${project.displayName}</b>: ${relevantItems.length} yeni TR/EN değişiklik, ` +
           `${skipped} tanesi gösterilmedi.\n` +
           `<a href="https://hosted.weblate.org/projects/${project.slug}/">Tümünü gör</a>`
         );
       }
 
-      results.push({ project: project.displayName, success: true, new_items: newItems.length, changes_sent: sentCount });
+      results.push({
+        project: project.displayName,
+        success: true,
+        new_items: newItems.length,
+        relevant_items: relevantItems.length,
+        changes_sent: sentCount,
+      });
 
     } catch (e) {
       console.error(`Error processing ${project.slug}:`, e);
