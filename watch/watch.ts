@@ -44,13 +44,13 @@ export const watchedProjects: WatchedProject[] = [
   {
     slug: 'mihon',
     displayName: 'Mihon',
-    emoji: '🚇'
+    emoji: ''
   },
 
   {
     slug: 'o-replay',
     displayName: 'O-Replay',
-    emoji: '🚇'
+    emoji: ''
   },
 ];
 
