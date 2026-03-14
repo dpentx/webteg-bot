@@ -16,23 +16,42 @@ export const watchedProjects: WatchedProject[] = [
     displayName: 'Metrolist',
     emoji: '🚇'
   },
+
+  {
+    slug: 'cloudstream',
+    displayName: 'CloudStream',
+    emoji: ''
+  },
+ 
+  {
+    slug: 'encore-tweaks',
+    displayName: 'Encore Tweaks',
+    emoji: ''
+  },
+ 
+  {
+    slug: 'neo-backup',
+    displayName: 'Neo Backup',
+    emoji: ''
+  },
+
+  {
+    slug: 'gaphor',
+    displayName: 'Gaphor',
+    emoji: ''
+  },
   
-  // Yeni projeler eklemek için:
-  // {
-  //   slug: 'f-droid',
-  //   displayName: 'F-Droid',
-  //   emoji: '📱'
-  // },
-  // {
-  //   slug: 'element',
-  //   displayName: 'Element',
-  //   emoji: '💬'
-  // },
-  // {
-  //   slug: 'osmand',
-  //   displayName: 'OsmAnd',
-  //   emoji: '🗺️'
-  // },
+  {
+    slug: 'mihon',
+    displayName: 'Mihon',
+    emoji: '🚇'
+  },
+
+  {
+    slug: 'o-replay',
+    displayName: 'O-Replay',
+    emoji: '🚇'
+  },
 ];
 
 /**
